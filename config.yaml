@@ -1,0 +1,160 @@
+server:
+  host: "127.0.0.1"
+  port: 8000
+  request_api_key: "local-test"
+  rpm_limit_per_api: 20
+  burst_per_api: 6
+  queue_when_limited: false
+  # --- 凭证池：在这里统一管理你的所有 Key ---
+  api_key_envs:
+    - "NVIDIA_API_KEY_1"
+    - "NVIDIA_API_KEY_2"
+    - "NVIDIA_API_KEY_3"
+    - "NVIDIA_API_KEY_4"
+    - "NVIDIA_API_KEY_5"
+    - "NVIDIA_API_KEY_6"
+    - "NVIDIA_API_KEY_7"
+    - "NVIDIA_API_KEY_8"
+    - "NVIDIA_API_KEY_9"
+    - "NVIDIA_API_KEY_10"
+
+health:
+  # 唯一的 429 限流：每次请求前 sleep 2^N 秒(N = 该 key 过去 window_seconds 内的 429 次数),
+  # 封顶 max_seconds。没有 cooldown、没有并发上限 —— delay 自动把 429 频率稳定在温和区间:
+  # 一直 429 → N 增大 → 自动降速;长时间没 429 → N 衰减到 0 → 不再 delay,继续加压。
+  pre_request_delay:
+    enabled: true
+    window_seconds: 300  # 5 分钟滑动窗口
+    max_seconds: 256     # 封顶 2^8 = 256s
+  max_recent_events: 30
+  persistence_file: "health_state.json"
+
+# 响应内容归档：用于追踪需要手工解析的特殊 token 格式
+# 默认 100MB 上限（10MB × 10 个滚动文件），按 size 自动滚动覆盖
+archive:
+  enabled: true
+  file_path: "logs/response_archive.jsonl"
+  max_bytes_per_file: 10485760    # 10MB
+  backup_count: 10                # 共保留约 100MB
+  categories:
+    - "harmony_repaired"
+    - "harmony_inferred"
+    - "harmony_unparsed"
+    - "validation_failed"
+    - "repetition_loop"
+
+# 1. 物理资源池：纯模型路径，不再绑定具体 Key
+tiers:
+  large:
+    - { name: "ds-pro", model: "deepseek-ai/deepseek-v4-pro" }
+    - { name: "glm5", model: "z-ai/glm-5.1" }
+    - { name: "kimi", model: "moonshotai/kimi-k2.6" }
+    - { name: "minimax-m3", model: "minimaxai/minimax-m3" }
+
+  medium:
+    - { name: "minimax-m2.7", model: "minimaxai/minimax-m2.7" }
+    - { name: "nemotron-ultra", model: "nvidia/nemotron-3-ultra-550b-a55b" }
+    - { name: "qwen-397", model: "qwen/qwen3.5-397b-a17b" }
+    - { name: "ds-flash", model: "deepseek-ai/deepseek-v4-flash" }
+
+  small:
+    - { name: "step-3.7-flash", model: "stepfun-ai/step-3.7-flash" }   # 196B total / ~11B active (MoE)
+    - { name: "nemotron", model: "nvidia/nemotron-3-super-120b-a12b" }
+    - { name: "gpt-oss", model: "openai/gpt-oss-120b" }
+    - { name: "qwen-122", model: "qwen/qwen3.5-122b-a10b" }
+
+  vision:
+    - { name: "kimi-vision", model: "moonshotai/kimi-k2.6" }
+    - { name: "qwen-397", model: "qwen/qwen3.5-397b-a17b" }
+    - { name: "step-3.7-flash", model: "stepfun-ai/step-3.7-flash" }   # 196B total / ~11B active (MoE)
+    - { name: "qwen-122", model: "qwen/qwen3.5-122b-a10b" }
+
+  # 单模型 tier — 用于 nim-kimi / nim-glm / nim-dspro，
+  # 并发槽位会循环命中同一个模型，不会跨到其他模型
+  kimi-only:
+    - { name: "kimi", model: "moonshotai/kimi-k2.6" }
+  glm-only:
+    - { name: "glm5", model: "z-ai/glm-5.1" }
+  dspro-only:
+    - { name: "ds-pro", model: "deepseek-ai/deepseek-v4-pro" }
+  minimax-only:
+    - { name: "minimax-m3", model: "minimaxai/minimax-m3" }
+
+# 2. 调度策略
+virtual_models:
+  nim-large:
+    hard_timeout_seconds: 1500
+    phases:
+      - { tier: "large", start_seconds: 0, end_seconds: 360, interval_seconds: 35 }
+      - { tier: "medium", start_seconds: 360, end_seconds: 900, interval_seconds: 50 }
+      - { tier: "small", start_seconds: 900, end_seconds: 1500, interval_seconds: 60 }
+
+  # Quality mode: fire all 4 large models; each model re-fires every 60s until
+  # it answers, until 2 distinct models have valid answers; then a hedged judge
+  # (large models, first valid pick wins) selects the best one.
+  # Opt-in — clients ask for this model explicitly. No fusion/synthesis.
+  nim-fusion:
+    mode: fusion
+    hard_timeout_seconds: 900
+    per_call_timeout_seconds: 300
+    fusion_tier: large
+    fusion_min_valid: 2
+    fusion_retry_interval_seconds: 60
+
+  nim-medium:
+    hard_timeout_seconds: 600
+    phases:
+      - { tier: "medium", start_seconds: 0, end_seconds: 300, interval_seconds: 30 }
+      - { tier: "small", start_seconds: 300, end_seconds: 600, interval_seconds: 45 }
+
+  nim-small:
+    hard_timeout_seconds: 180
+    phases:
+      - { tier: "small", start_seconds: 0, end_seconds: 180, interval_seconds: 30 }
+
+  nim-vision:
+    hard_timeout_seconds: 600
+    phases:
+      - { tier: "vision", start_seconds: 0, end_seconds: 240, interval_seconds: 45 }
+      - { tier: "vision", start_seconds: 240, end_seconds: 600, interval_seconds: 30 }
+
+  # 手动切换的单模型测试入口
+  nim-kimi:
+    hard_timeout_seconds: 600
+    phases:
+      - { tier: "kimi-only", start_seconds: 0, end_seconds: 600, interval_seconds: 60 }
+
+  nim-glm:
+    hard_timeout_seconds: 600
+    phases:
+      - { tier: "glm-only", start_seconds: 0, end_seconds: 600, interval_seconds: 60 }
+
+  nim-dspro:
+    hard_timeout_seconds: 600
+    phases:
+      - { tier: "dspro-only", start_seconds: 0, end_seconds: 600, interval_seconds: 60 }
+
+  nim-minimax:
+    hard_timeout_seconds: 600
+    phases:
+      - { tier: "minimax-only", start_seconds: 0, end_seconds: 600, interval_seconds: 60 }
+
+# 候选排序策略
+#   enabled: true  -> 每个 phase 内按健康分数动态排序(高分优先)
+#   enabled: false -> 严格按 tiers 配置中的列表顺序
+#   tier_overrides: 针对单个 tier 覆盖默认值(key 为 tier 名,如 large/medium/vision)
+ranking:
+  enabled: true
+  tier_overrides:
+    vision: false
+
+# Record {request, every candidate output, winner} per served request so the
+# fusion dataset accumulates from real traffic. Records only calls that actually
+# ran (no extra upstream calls). Consumed by scripts/fusion_eval.py.
+# Total disk cap ≈ max_bytes_per_file × (backup_count + 1) ≈ 20 GB by default.
+record:
+  enabled: true
+  file_path: logs/fusion_dataset.jsonl
+  max_bytes_per_file: 2147483648   # 2 GB
+  backup_count: 9                  # ~20 GB total
+  only_virtual_models: [nim-fusion]   # empty = all; restrict to keep disk small
