@@ -1,0 +1,29 @@
+# Secrets and local configuration
+.env
+config.yaml
+*.local.yaml
+*.local.yml
+
+# Runtime state and logs
+health_state.json
+logs/
+*.jsonl
+*.log
+
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local agent/tool state
+.agents/
+.codex/
+.claude/
+
+# OS/editor noise
+.DS_Store
+*~

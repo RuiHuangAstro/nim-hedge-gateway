@@ -1,0 +1,107 @@
+server:
+  host: "127.0.0.1"
+  port: 8000
+  request_api_key: "local-test"
+  log_level: "info"
+  api_key_envs:
+    - "NVIDIA_API_KEY_1"
+    - "NVIDIA_API_KEY_2"
+    - "NVIDIA_API_KEY_3"
+  # Token bucket: set rpm_limit_per_api to cap upstream RPM per key proactively.
+  # 0 = unlimited. burst_per_api = initial/max burst (0 defaults to rpm_limit_per_api).
+  rpm_limit_per_api: 0
+  burst_per_api: 0
+  # When all keys are busy or rate-limited, queue requests for up to max_queue_seconds
+  # before returning a synthetic 429. queue_when_limited: false disables this.
+  queue_when_limited: false
+  max_queue_seconds: 20.0
+  # If true, allow a key with an empty token bucket to be selected as last resort.
+  allow_best_effort_when_all_limited: false
+
+health:
+  # The only 429 throttle: per-key pre-request delay = 2^N seconds, where N is
+  # the number of 429s that key got in the last window_seconds (capped at
+  # max_seconds). No cooldown and no concurrency cap — the delay self-regulates
+  # the request rate toward a mild, steady 429 frequency.
+  pre_request_delay:
+    enabled: true
+    window_seconds: 300
+    max_seconds: 256
+  max_recent_events: 200       # hard cap on stored events per candidate
+  score_window_seconds: 1800   # only events within this window feed scoring (30 min)
+  persistence_file: "health_state.json"
+
+archive:
+  enabled: true
+  file_path: "logs/response_archive.jsonl"
+  max_bytes_per_file: 10485760
+  backup_count: 10
+  categories:
+    - "harmony_repaired"
+    - "harmony_inferred"
+    - "harmony_unparsed"
+    - "validation_failed"
+
+tiers:
+  large:
+    - { name: "large-primary", model: "qwen/qwen3.5-397b-a17b" }
+    - { name: "large-backup", model: "nvidia/nemotron-3-super-120b-a12b" }
+
+  medium:
+    - { name: "medium-primary", model: "qwen/qwen3.5-122b-a10b" }
+    - { name: "medium-backup", model: "z-ai/glm4.7" }
+
+  small:
+    - { name: "small-primary", model: "qwen/qwen3.5-122b-a10b" }
+    - { name: "small-backup", model: "openai/gpt-oss-120b" }
+
+virtual_models:
+  nim-large:
+    description: "Large model pool with medium/small fallbacks."
+    hard_timeout_seconds: 1500
+    per_call_timeout_seconds: 300   # per individual LiteLLM call; 0 = use hard_timeout_seconds
+    require_valid_response: true
+    phases:
+      - { tier: "large", start_seconds: 0, end_seconds: 360, interval_seconds: 40 }
+      - { tier: "medium", start_seconds: 360, end_seconds: 900, interval_seconds: 50 }
+      - { tier: "small", start_seconds: 900, end_seconds: 1500, interval_seconds: 60 }
+
+  # Quality mode (opt-in): fire all large models, each re-firing every 60s until
+  # 2 distinct models answer validly, then a hedged judge selects the best.
+  nim-fusion:
+    description: "Fan out diverse large models and select the best (no synthesis)."
+    mode: fusion
+    hard_timeout_seconds: 900
+    per_call_timeout_seconds: 300
+    fusion_tier: large
+    fusion_min_valid: 2
+    fusion_retry_interval_seconds: 60
+
+  nim-medium:
+    description: "Balanced model pool for routine coding and analysis."
+    hard_timeout_seconds: 600
+    require_valid_response: true
+    phases:
+      - { tier: "medium", start_seconds: 0, end_seconds: 300, interval_seconds: 30 }
+      - { tier: "small", start_seconds: 300, end_seconds: 600, interval_seconds: 45 }
+
+  nim-small:
+    description: "Fast model pool for low-latency requests."
+    hard_timeout_seconds: 180
+    require_valid_response: true
+    phases:
+      - { tier: "small", start_seconds: 0, end_seconds: 180, interval_seconds: 30 }
+
+ranking:
+  enabled: true
+  tier_overrides: {}
+
+# Record {request, every candidate output, winner} per served request so the
+# fusion dataset accumulates from real traffic (consumed by scripts/fusion_eval.py).
+# Records only calls that actually ran. Disk cap ≈ max_bytes_per_file × (backup_count + 1).
+record:
+  enabled: false
+  file_path: logs/fusion_dataset.jsonl
+  max_bytes_per_file: 2147483648   # 2 GB
+  backup_count: 9                  # ~20 GB total
+  only_virtual_models: []          # empty = all; e.g. [nim-fusion] to restrict
