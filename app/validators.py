@@ -14,7 +14,9 @@ def _detect_repetition_loop(content: str) -> Tuple[bool, Optional[str]]:
     """Return (True, reason) if content looks like a model repetition degeneration loop.
 
     Two detection modes:
-      1. Medium ngrams (5-59 chars) repeated >=4 times anywhere in content.
+      1. Medium ngrams (12-59 chars) repeated >=4 times AND covering >50% of the
+         content (a true loop dominates the output; a few repeated markdown table
+         separators or ASCII-chart rows do not).
       2. Short non-space ngrams (2-4 chars) repeated >=5 times AND covering >50%
          of the content length (catches patterns like "3.3.3.3.3" or "X,X,X,X,X").
 
@@ -40,8 +42,13 @@ def _detect_repetition_loop(content: str) -> Tuple[bool, Optional[str]]:
                     break
                 count += 1
                 pos += ngram_len
-            if count >= 4:
-                return True, f"repetition loop: {ngram[:20]!r} repeated {count}x"
+            # A genuine degeneration loop dominates the output. Legit structured
+            # content (markdown table separators, ASCII bar charts) repeats short
+            # structural ngrams a handful of times but they cover only a few %
+            # of the response — so require coverage like Mode 2, not just count.
+            coverage = count * ngram_len / len(content)
+            if count >= 4 and coverage > 0.5:
+                return True, f"repetition loop: {ngram[:20]!r} repeated {count}x ({coverage:.0%} of content)"
     for ngram_len in range(2, 5):
         for i in range(len(content) - ngram_len * 5 + 1):
             ngram = content[i:i + ngram_len]

@@ -114,3 +114,60 @@ def test_validate_finish_reason_length_with_tool_calls_invalid():
     validation = validate_openai_chat_completion(result)
     assert validation.ok is False
     assert "length" in validation.reason
+
+
+def _validate_content(content: str):
+    resp = MockResponse(choices=[MockChoice(message=MockMessage(content=content))])
+    result = CandidateResult(candidate_name="test", real_model="test", response=resp, latency_ms=100)
+    return validate_openai_chat_completion(result)
+
+
+def test_repetition_loop_real_degeneration_rejected():
+    # A genuine loop dominates the output -> must be rejected.
+    content = "Here is the answer.\n" + ("the same broken line\n" * 60)
+    validation = _validate_content(content)
+    assert validation.ok is False
+    assert "repetition loop" in (validation.reason or "")
+
+
+def test_repetition_markdown_tables_pass():
+    # Legit report with several markdown tables: separators repeat a handful of
+    # times but cover ~nothing of the content. Must NOT be flagged (regression:
+    # these were cascading whole requests through the pool).
+    content = (
+        "# RST v3 Deep Optimization - Final Report\n\n"
+        "## Summary\nThe optimization completed successfully with strong results "
+        "across every regime we tested, and the bull family remained dominant.\n\n"
+    )
+    for section in ("Bull", "Bear", "Sideways", "Combined"):
+        content += (
+            f"## {section} regime\n\n"
+            "| metric | value | delta |\n"
+            "|--------|-------|-------|\n"
+            "| sharpe | 1.23  | +0.05 |\n"
+            "| return | 0.18  | +0.02 |\n\n"
+            "Detailed discussion of the findings for this regime goes here with "
+            "enough prose to make the table separators a tiny fraction of text.\n\n"
+        )
+    validation = _validate_content(content)
+    assert validation.ok is True, validation.reason
+
+
+def test_repetition_ascii_chart_passes():
+    # ASCII bar chart: ')  0.0h ░░░' style rows repeat per day but are a small
+    # fraction of the message. Must NOT be flagged.
+    content = (
+        "📱⚠️ 手机使用超标！\n\n今天 4:00-15:00: 2h 3min\n7天同时段均值: 46min\n超出: 1h 16min\n\n"
+        "📉 近7天同时段对比：\n"
+        "  今天(Sun)   2.0h ███████████████ ⬆️\n"
+        "  06/13(Sat)   1.2h █████░░░░░░░░░░\n"
+        "  06/12(Fri)   0.0h ░░░░░░░░░░░░░░░\n"
+        "  06/11(Thu)   0.8h ███░░░░░░░░░░░░\n"
+        "  06/10(Wed)   0.0h ░░░░░░░░░░░░░░░\n"
+        "  06/09(Tue)   0.0h ░░░░░░░░░░░░░░░\n"
+        "  06/08(Mon)   1.7h ███████░░░░░░░░\n"
+        "  06/07(Sun)   0.0h ░░░░░░░░░░░░░░░\n\n"
+        "💡 建议放下手机，专注工作 🎯"
+    )
+    validation = _validate_content(content)
+    assert validation.ok is True, validation.reason
