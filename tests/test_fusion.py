@@ -25,7 +25,7 @@ def make_request():
 
 
 def is_judge_request(req: ChatCompletionRequest) -> bool:
-    return "impartial selector" in (req.messages[0].content or "")
+    return "impartial reviewer" in (req.messages[0].content or "")
 
 
 @pytest.fixture(autouse=True)
@@ -68,9 +68,14 @@ async def test_judge_uses_growing_candidate_pool(monkeypatch):
                 ), None
             else:  # kimi as judge: fast, picks the 3rd candidate (label C)
                 await asyncio.sleep(0.02)
+                critique = (
+                    '{"best": "C", "reason": "most complete", '
+                    '"scores": {"A": {"correctness": 4}, "C": {"correctness": 5}}, '
+                    '"missed_by_winner": []}'
+                )
                 return CandidateResult(
                     candidate_name="kimi-judge", real_model=kimi.model,
-                    response=FakeResponse('{"best": "C"}'), latency_ms=20,
+                    response=FakeResponse(critique), latency_ms=20,
                 ), None
 
         # Phase-1 candidate lanes.
@@ -109,6 +114,13 @@ async def test_judge_uses_growing_candidate_pool(monkeypatch):
     assert finalists == {"ds-pro", "glm5", "kimi"}
     assert "kimi-k2.6" in winner.fusion_judge_path or "kimi" in winner.fusion_judge_path
     assert "cancel" in winner.fusion_judge_path  # the slow glm5 judge got cancelled
+
+    # The winning judge's structured critique is captured, with labels mapped
+    # back to candidate names.
+    assert winner.fusion_judge_model == "kimi"
+    assert winner.fusion_judge_analysis["critique"]["best"] == "C"
+    assert winner.fusion_judge_analysis["critique"]["reason"] == "most complete"
+    assert winner.fusion_judge_analysis["labels"]["C"] == "kimi"
 
 
 @pytest.mark.asyncio

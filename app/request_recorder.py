@@ -122,6 +122,7 @@ def record_request(
             "virtual_model": virtual_model,
             "winner": winner.candidate_name if winner else None,
             "fusion_judge_model": winner.fusion_judge_model if winner else None,
+            "fusion_judge_analysis": winner.fusion_judge_analysis if winner else None,
             "request": request.model_dump(exclude_none=True),
             "candidates": [_candidate_record(r, request) for r in all_results],
         }

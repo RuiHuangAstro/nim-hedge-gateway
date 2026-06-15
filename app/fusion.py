@@ -15,8 +15,14 @@ Spec:
      fusion_judge_interval_seconds. Each judge sees a snapshot of whatever
      candidates have arrived by the time it's dispatched — so if phase 1 turns
      up a 3rd (or 4th) valid answer while the first judge is still pending, the
-     next judge dispatched chooses from the larger pool. No scoring rubric, no
-     fusion of text; the judge just chooses which existing answer to return.
+     next judge dispatched chooses from the larger pool. The judge writes no
+     answer of its own; it only picks one of the existing candidates.
+  5. The judge's prompt asks for a *structured critique*, not just a pick: per
+     candidate scores (correctness/completeness/specificity), red flags, a
+     reason for its pick, and anything important the winner missed. This is
+     stored as `fusion_judge_analysis` on the winner (with labels mapped back
+     to candidate names) so it can be analyzed offline — the served response
+     is still just the winner's original answer, unchanged.
 
 Returns (winner, all_results) matching hedged_completion so main.py is agnostic.
 Every valid candidate keeps its full `response` in all_results, so the request
@@ -26,7 +32,7 @@ import asyncio
 import json
 import random
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.models import ChatCompletionRequest, ChatCompletionMessage, CandidateResult
 from app.config import VirtualModelStrategy, RawModel, config
@@ -65,13 +71,28 @@ def _build_judge_request(
         blocks.append(f"### Answer {label}\n{ans}")
     answers_text = "\n\n".join(blocks)
 
+    labels = list(label_to_idx.keys())
     system = (
-        "You are an impartial selector. Given a task and several candidate "
-        "answers, choose the single best answer by correctness, completeness, "
-        "and helpfulness. Do not write your own answer. Respond with ONLY a "
-        'JSON object: {"best": "<LETTER>"}.'
+        "You are an impartial reviewer comparing candidate answers to the same "
+        "task. Do not write your own answer.\n\n"
+        "For EACH candidate, score correctness, completeness, and specificity "
+        "from 1 (poor) to 5 (excellent), and list any red flags (factual "
+        "errors, unsafe/incorrect actions, hallucinated details, missing "
+        "required info). Then pick the single best overall answer, explain why "
+        "briefly, and note anything important that the winner missed but "
+        "another candidate covered.\n\n"
+        "Respond with ONLY a JSON object of this exact shape:\n"
+        "{\n"
+        '  "scores": {"<LETTER>": {"correctness": 1-5, "completeness": 1-5, '
+        '"specificity": 1-5, "red_flags": ["..."]}, ...},\n'
+        '  "best": "<LETTER>",\n'
+        '  "reason": "short justification",\n'
+        '  "missed_by_winner": ["points the winner missed that another '
+        'candidate covered"]\n'
+        "}\n"
+        f"Score and pick only among: {', '.join(labels)}."
     )
-    user = f"## Task\n{task}\n\n## Candidate answers\n{answers_text}\n\nReturn the best letter."
+    user = f"## Task\n{task}\n\n## Candidate answers\n{answers_text}\n\nReturn the JSON critique."
 
     return ChatCompletionRequest(
         model=fusion_tier,
@@ -80,25 +101,31 @@ def _build_judge_request(
             ChatCompletionMessage(role="user", content=user),
         ],
         temperature=0.0,
-        max_tokens=200,
+        max_tokens=800,
     )
 
 
-def _parse_pick(content: Optional[str], valid_labels: List[str]) -> Optional[str]:
+def _parse_judge_response(
+    content: Optional[str], valid_labels: List[str]
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Parse a judge's structured critique JSON. Returns (picked_letter, critique)
+    where critique is the full parsed object (for recording/analysis), or None
+    if JSON parsing failed. Falls back to scanning for a bare letter if the
+    judge didn't return valid JSON at all."""
     if not content:
-        return None
+        return None, None
     text = content.strip()
     try:
         obj = json.loads(text[text.index("{"): text.rindex("}") + 1])
         letter = str(obj.get("best", "")).strip().upper()[:1]
         if letter in valid_labels:
-            return letter
+            return letter, obj
     except Exception:
         pass
     for ch in text.upper():
         if ch in valid_labels:
-            return ch
-    return None
+            return ch, None
+    return None, None
 
 
 def _render_judge_path(trace: List[Tuple[str, str]], picked_model: Optional[str]) -> str:
@@ -141,7 +168,7 @@ async def _judge_select(
     candidates: List[CandidateResult],
     pending_lanes: set,
     deadline: float,
-) -> Tuple[CandidateResult, str, Optional[str]]:
+) -> Tuple[CandidateResult, str, Optional[str], Optional[Dict[str, Any]]]:
     """Hedged selection, nim-large style: dispatch judges one at a time staggered
     by fusion_judge_interval_seconds. Earlier judges stay in flight (first valid
     pick wins), but a backup is only fired if the previous one is slow — so a
@@ -156,8 +183,10 @@ async def _judge_select(
     cancels whatever's left when it returns.
 
     Returns the chosen candidate, a rendered judge-race path for the console,
-    and the tier name (e.g. "glm5") of the judge that made the pick — or None
-    if no judge decided and the fastest candidate was kept instead.
+    the tier name (e.g. "glm5") of the judge that made the pick (or None if no
+    judge decided and the fastest candidate was kept instead), and the judge's
+    structured critique — `{"labels": {"A": "<candidate_name>", ...}, "critique":
+    {...the judge's raw JSON...}}` — or None if no judge produced one.
     """
     candidates = list(candidates)
     judge_models = _ordered_judges(virtual_model, strategy.fusion_tier)
@@ -169,6 +198,7 @@ async def _judge_select(
     trace: List[Tuple[str, str]] = []
     selected: Optional[CandidateResult] = None
     judge_name: Optional[str] = None
+    judge_analysis: Optional[Dict[str, Any]] = None
     next_idx = 0
     next_fire = time.monotonic()
     try:
@@ -222,11 +252,17 @@ async def _judge_select(
                         content = result.response.model_dump()["choices"][0]["message"].get("content")
                     except Exception:
                         content = None
-                    letter = _parse_pick(content, labels)
+                    letter, critique = _parse_judge_response(content, labels)
                     if letter is not None:
                         trace.append((short, "win"))
                         selected = candidates[label_to_idx[letter]]
                         judge_name = tier_name
+                        if critique is not None:
+                            label_map = {
+                                lbl: candidates[i].candidate_name
+                                for lbl, i in label_to_idx.items()
+                            }
+                            judge_analysis = {"labels": label_map, "critique": critique}
                         break
                     trace.append((short, "noparse"))
                 else:
@@ -250,8 +286,13 @@ async def _judge_select(
     if selected is None:
         # Every judge failed/abstained — keep it simple: take the fastest answer.
         selected = min(candidates, key=lambda c: c.latency_ms)
-        return selected, _render_judge_path(trace, None), None
-    return selected, _render_judge_path(trace, selected.real_model.split("/")[-1]), judge_name
+        return selected, _render_judge_path(trace, None), None, None
+    return (
+        selected,
+        _render_judge_path(trace, selected.real_model.split("/")[-1]),
+        judge_name,
+        judge_analysis,
+    )
 
 
 def _process_attempt(
@@ -402,11 +443,12 @@ async def fusion_completion(
         # answered yet) keep going in the background — _judge_select owns
         # `pending` now and folds in any new valid answers before dispatching
         # the next staggered judge.
-        winner, judge_path, judge_name = await _judge_select(
+        winner, judge_path, judge_name, judge_analysis = await _judge_select(
             request, strategy, virtual_model, valid, pending, deadline,
         )
         winner.fusion_judge_path = judge_path
         winner.fusion_judge_model = judge_name
+        winner.fusion_judge_analysis = judge_analysis
 
     winner.is_winner = True
     return winner, all_results
