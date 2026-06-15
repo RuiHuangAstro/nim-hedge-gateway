@@ -282,10 +282,12 @@ async def chat_completions(request: ChatCompletionRequest):
     load_str = ",".join(map(str, stats["load_distribution"]))
     print(f"[Active: {stats['total_active']} | Load: {load_str} | 429s (5m): {stats['recent_429_count']}]")
 
-    print(f"[{start_timestamp}->{end_timestamp}] {request.model}: {attempt_path} | {latency_str}{degraded_str}{usage_str}{repair_str}{paid_str}")
-    # Fusion: second line showing the hedged judge race.
+    prefix = f"[{start_timestamp}->{end_timestamp}] "
+    print(f"{prefix}{request.model}: {attempt_path} | {latency_str}{degraded_str}{usage_str}{repair_str}{paid_str}")
+    # Fusion: second line showing the hedged judge race, aligned under the
+    # virtual-model column above.
     if winner.fusion_judge_path:
-        print(f"           [fusion-judge] {winner.fusion_judge_path}")
+        print(f"{' ' * len(prefix)}fusion-judge: {winner.fusion_judge_path}")
     # ----------------------------------------------
 
     headers = {

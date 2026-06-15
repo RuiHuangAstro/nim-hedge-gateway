@@ -6,12 +6,17 @@ Spec:
      yet, re-fire it every fusion_retry_interval_seconds (default 60s) — proper
      per-model hedging, so multiple attempts of one model can be in flight. A
      model that has already answered validly is never re-fired.
-  3. Stop the whole collection as soon as fusion_min_valid (default 2) *distinct*
-     models have answered validly; cancel everything still running.
-  4. Select — not synthesize — among the valid answers with a *hedged judge*:
-     fire judge calls to the same tier's models concurrently and accept the
-     FIRST judge that returns a valid pick. No scoring rubric, no fusion of
-     text; the judge just chooses which existing answer to return.
+  3. Once fusion_min_valid (default 2) *distinct* models have answered validly,
+     enter the judge phase — but lanes that are still running keep going in the
+     background until a judge picks (or the deadline hits).
+  4. Select — not synthesize — among the valid answers with a *staggered hedged
+     judge* (nim-large style): dispatch one judge at a time, only firing the
+     next if the previous hasn't returned a valid pick within
+     fusion_judge_interval_seconds. Each judge sees a snapshot of whatever
+     candidates have arrived by the time it's dispatched — so if phase 1 turns
+     up a 3rd (or 4th) valid answer while the first judge is still pending, the
+     next judge dispatched chooses from the larger pool. No scoring rubric, no
+     fusion of text; the judge just chooses which existing answer to return.
 
 Returns (winner, all_results) matching hedged_completion so main.py is agnostic.
 Every valid candidate keeps its full `response` in all_results, so the request
@@ -134,26 +139,31 @@ async def _judge_select(
     strategy: VirtualModelStrategy,
     virtual_model: str,
     candidates: List[CandidateResult],
+    pending_lanes: set,
     deadline: float,
 ) -> Tuple[CandidateResult, str]:
     """Hedged selection, nim-large style: dispatch judges one at a time staggered
     by fusion_judge_interval_seconds. Earlier judges stay in flight (first valid
     pick wins), but a backup is only fired if the previous one is slow — so a
     fast judge means only one call is ever made. Falls back to the fastest
-    candidate if every judge fails. Returns the chosen candidate plus a rendered
-    judge-race path for the console."""
-    # Shuffle labels once so a fixed answer order can't bias every judge.
-    order = list(range(len(candidates)))
-    random.shuffle(order)
-    labels = [chr(ord("A") + i) for i in range(len(order))]
-    label_to_idx = {lbl: order[i] for i, lbl in enumerate(labels)}
+    candidate if every judge fails.
 
-    judge_req = _build_judge_request(request, strategy.fusion_tier, candidates, label_to_idx)
+    `pending_lanes` are phase-1 model lanes that hadn't produced a valid answer
+    yet when the judge phase started; they keep running in the background. Each
+    newly-dispatched judge is built from a fresh snapshot of `candidates`, so if
+    one of these lanes lands a valid answer before the next judge fires, that
+    judge chooses from the larger pool. This function owns `pending_lanes` and
+    cancels whatever's left when it returns.
+
+    Returns the chosen candidate plus a rendered judge-race path for the console.
+    """
+    candidates = list(candidates)
     judge_models = _ordered_judges(virtual_model, strategy.fusion_tier)
     per_call = strategy.per_call_timeout_seconds or strategy.hard_timeout_seconds
     interval = max(1.0, strategy.fusion_judge_interval_seconds)
 
-    inflight: Dict[asyncio.Task, str] = {}
+    # judge task -> (short_model_name, labels, label_to_idx) snapshot at dispatch time
+    inflight: Dict[asyncio.Task, Tuple[str, List[str], Dict[str, int]]] = {}
     trace: List[Tuple[str, str]] = []
     selected: Optional[CandidateResult] = None
     next_idx = 0
@@ -161,56 +171,77 @@ async def _judge_select(
     try:
         while selected is None and time.monotonic() < deadline:
             now = time.monotonic()
-            # Stagger: fire the next judge only when its turn comes up.
+            # Stagger: fire the next judge only when its turn comes up, using
+            # whatever candidates have arrived so far.
             if next_idx < len(judge_models) and now >= next_fire:
                 jm = judge_models[next_idx]
+                order = list(range(len(candidates)))
+                random.shuffle(order)
+                labels = [chr(ord("A") + i) for i in range(len(order))]
+                label_to_idx = {lbl: order[i] for i, lbl in enumerate(labels)}
+                judge_req = _build_judge_request(request, strategy.fusion_tier, candidates, label_to_idx)
                 task = asyncio.create_task(
                     call_with_dynamic_key(
                         jm, judge_req, strategy.hard_timeout_seconds, per_call,
                         0.0, virtual_model, False,
                     )
                 )
-                inflight[task] = jm.model.split("/")[-1]
+                inflight[task] = (jm.model.split("/")[-1], labels, label_to_idx)
                 next_idx += 1
                 next_fire = now + interval
 
-            if not inflight:
+            wait_tasks = set(inflight) | pending_lanes
+            if not wait_tasks:
                 if next_idx >= len(judge_models):
                     break  # nothing in flight and nothing left to dispatch
                 await asyncio.sleep(max(0.0, min(next_fire, deadline) - time.monotonic()))
                 continue
 
-            # Wait until the next dispatch is due (if any) or a judge returns.
+            # Wait until the next dispatch is due (if any), a judge returns, or
+            # a still-running phase-1 lane lands a new candidate.
             horizon = next_fire if next_idx < len(judge_models) else deadline
             wait_for = max(0.0, min(horizon, deadline) - time.monotonic())
             done, _ = await asyncio.wait(
-                set(inflight), timeout=wait_for, return_when=asyncio.FIRST_COMPLETED,
+                wait_tasks, timeout=wait_for, return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
-                short = inflight.pop(task)
-                try:
-                    result, _key = await task
-                except Exception:
-                    trace.append((short, "fail"))
-                    continue
-                if result.error or result.response is None:
-                    trace.append((short, "fail"))
-                    continue
-                try:
-                    content = result.response.model_dump()["choices"][0]["message"].get("content")
-                except Exception:
-                    content = None
-                letter = _parse_pick(content, labels)
-                if letter is not None:
-                    trace.append((short, "win"))
-                    selected = candidates[label_to_idx[letter]]
-                    break
-                trace.append((short, "noparse"))
+                if task in inflight:
+                    short, labels, label_to_idx = inflight.pop(task)
+                    try:
+                        result, _key = await task
+                    except Exception:
+                        trace.append((short, "fail"))
+                        continue
+                    if result.error or result.response is None:
+                        trace.append((short, "fail"))
+                        continue
+                    try:
+                        content = result.response.model_dump()["choices"][0]["message"].get("content")
+                    except Exception:
+                        content = None
+                    letter = _parse_pick(content, labels)
+                    if letter is not None:
+                        trace.append((short, "win"))
+                        selected = candidates[label_to_idx[letter]]
+                        break
+                    trace.append((short, "noparse"))
+                else:
+                    pending_lanes.discard(task)
+                    try:
+                        res = await task
+                    except Exception:
+                        res = None
+                    if res is not None:
+                        res.is_finalist = True
+                        candidates.append(res)
     finally:
-        for t, short in inflight.items():
+        for t, (short, _labels, _map) in inflight.items():
             if not t.done():
                 t.cancel()
             trace.append((short, "cancel"))
+        for t in pending_lanes:
+            if not t.done():
+                t.cancel()
 
     if selected is None:
         # Every judge failed/abstained — keep it simple: take the fastest answer.
@@ -318,8 +349,9 @@ async def fusion_completion(
     all_results: List[CandidateResult] = []
 
     # One lane per distinct model. Each lane returns that model's first valid
-    # answer (or None). The collection ends once `need` lanes have produced a
-    # valid answer — i.e. `need` distinct models — then the rest are cancelled.
+    # answer (or None). This first wait ends once `need` lanes have produced a
+    # valid answer — i.e. `need` distinct models — then the judge phase takes
+    # over (it may keep the remaining lanes running; see below).
     lanes = [
         asyncio.create_task(
             _model_lane(m, request, strategy, virtual_model, deadline, all_results)
@@ -328,29 +360,27 @@ async def fusion_completion(
     ]
     valid: List[CandidateResult] = []
     pending = set(lanes)
-    try:
-        while pending and len(valid) < need:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED, timeout=remaining,
-            )
-            if not done:
-                break
-            for lane in done:
-                try:
-                    res = await lane
-                except Exception:
-                    res = None
-                if res is not None:
-                    valid.append(res)
-    finally:
+    while pending and len(valid) < need:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        done, pending = await asyncio.wait(
+            pending, return_when=asyncio.FIRST_COMPLETED, timeout=remaining,
+        )
+        if not done:
+            break
+        for lane in done:
+            try:
+                res = await lane
+            except Exception:
+                res = None
+            if res is not None:
+                valid.append(res)
+
+    if not valid:
         for lane in pending:
             if not lane.done():
                 lane.cancel()
-
-    if not valid:
         return None, all_results
 
     # Every valid answer reached the judge — mark them all as finalists so the
@@ -359,10 +389,17 @@ async def fusion_completion(
         c.is_finalist = True
 
     if len(valid) == 1:
+        for lane in pending:
+            if not lane.done():
+                lane.cancel()
         winner = valid[0]
     else:
+        # Lanes still running (e.g. min_valid=2 but other models haven't
+        # answered yet) keep going in the background — _judge_select owns
+        # `pending` now and folds in any new valid answers before dispatching
+        # the next staggered judge.
         winner, judge_path = await _judge_select(
-            request, strategy, virtual_model, valid, deadline,
+            request, strategy, virtual_model, valid, pending, deadline,
         )
         winner.fusion_judge_path = judge_path
 
