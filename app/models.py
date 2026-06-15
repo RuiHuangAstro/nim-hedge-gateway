@@ -53,4 +53,5 @@ class CandidateResult(BaseModel):
     degraded: bool = False
     is_winner: bool = False
     is_finalist: bool = False  # fusion: a valid answer that went to the judge
+    fusion_judge_path: Optional[str] = None  # fusion: rendered judge-race line
     from_paid_fallback: bool = False  # set when this came from a non-NIM paid endpoint

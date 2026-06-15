@@ -96,15 +96,37 @@ def _parse_pick(content: Optional[str], valid_labels: List[str]) -> Optional[str
     return None
 
 
+def _render_judge_path(trace: List[Tuple[str, str]], picked_model: Optional[str]) -> str:
+    """trace: list of (judge_short_model, status) in resolution order, where
+    status is 'win' | 'noparse' | 'fail' | 'cancel'. Renders one console line."""
+    labels = []
+    for short, status in trace:
+        if status == "win":
+            labels.append(f"\033[1m{short} [win]\033[0m")
+        elif status == "noparse":
+            labels.append(f"{short} [no-pick]")
+        elif status == "cancel":
+            labels.append(f"{short} [cancel]")
+        else:
+            labels.append(f"{short} [!]")
+    path = " -> ".join(labels)
+    if picked_model:
+        path += f"  => picked {picked_model}"
+    else:
+        path += "  => no judge decided, kept fastest"
+    return path
+
+
 async def _judge_select(
     request: ChatCompletionRequest,
     strategy: VirtualModelStrategy,
     virtual_model: str,
     candidates: List[CandidateResult],
     deadline: float,
-) -> CandidateResult:
+) -> Tuple[CandidateResult, str]:
     """Hedged selection: fire judges concurrently, accept the first valid pick.
-    Falls back to the first (fastest) candidate if every judge fails."""
+    Falls back to the fastest candidate if every judge fails. Returns the chosen
+    candidate plus a rendered judge-race path for the console."""
     # Shuffle labels once so a fixed answer order can't bias every judge.
     order = list(range(len(candidates)))
     random.shuffle(order)
@@ -115,18 +137,20 @@ async def _judge_select(
     judge_models: List[RawModel] = config.tiers.get(strategy.fusion_tier, [])
     per_call = strategy.per_call_timeout_seconds or strategy.hard_timeout_seconds
 
-    tasks = [
+    task_to_model = {
         asyncio.create_task(
             call_with_dynamic_key(
                 jm, judge_req, strategy.hard_timeout_seconds, per_call,
                 0.0, virtual_model, False,
             )
-        )
+        ): jm.model.split("/")[-1]
         for jm in judge_models
-    ]
+    }
+    trace: List[Tuple[str, str]] = []
+    selected: Optional[CandidateResult] = None
+    pending = set(task_to_model)
     try:
-        pending = set(tasks)
-        while pending:
+        while pending and selected is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -136,11 +160,14 @@ async def _judge_select(
             if not done:
                 break
             for task in done:
+                short = task_to_model[task]
                 try:
                     result, _key = await task
                 except Exception:
+                    trace.append((short, "fail"))
                     continue
                 if result.error or result.response is None:
+                    trace.append((short, "fail"))
                     continue
                 try:
                     content = result.response.model_dump()["choices"][0]["message"].get("content")
@@ -148,14 +175,21 @@ async def _judge_select(
                     content = None
                 letter = _parse_pick(content, labels)
                 if letter is not None:
-                    return candidates[label_to_idx[letter]]
+                    trace.append((short, "win"))
+                    selected = candidates[label_to_idx[letter]]
+                    break
+                trace.append((short, "noparse"))
     finally:
-        for t in tasks:
+        for t in pending:
             if not t.done():
                 t.cancel()
+            trace.append((task_to_model[t], "cancel"))
 
-    # Every judge failed/abstained — keep it simple: take the fastest answer.
-    return min(candidates, key=lambda c: c.latency_ms)
+    if selected is None:
+        # Every judge failed/abstained — keep it simple: take the fastest answer.
+        selected = min(candidates, key=lambda c: c.latency_ms)
+        return selected, _render_judge_path(trace, None)
+    return selected, _render_judge_path(trace, selected.real_model.split("/")[-1])
 
 
 def _process_attempt(
@@ -300,7 +334,10 @@ async def fusion_completion(
     if len(valid) == 1:
         winner = valid[0]
     else:
-        winner = await _judge_select(request, strategy, virtual_model, valid, deadline)
+        winner, judge_path = await _judge_select(
+            request, strategy, virtual_model, valid, deadline,
+        )
+        winner.fusion_judge_path = judge_path
 
     winner.is_winner = True
     return winner, all_results

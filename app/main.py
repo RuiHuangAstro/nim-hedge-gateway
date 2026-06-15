@@ -283,6 +283,9 @@ async def chat_completions(request: ChatCompletionRequest):
     print(f"[Active: {stats['total_active']} | Load: {load_str} | 429s (5m): {stats['recent_429_count']}]")
 
     print(f"[{start_timestamp}->{end_timestamp}] {request.model}: {attempt_path} | {latency_str}{degraded_str}{usage_str}{repair_str}{paid_str}")
+    # Fusion: second line showing the hedged judge race.
+    if winner.fusion_judge_path:
+        print(f"           [fusion-judge] {winner.fusion_judge_path}")
     # ----------------------------------------------
 
     headers = {
