@@ -54,4 +54,5 @@ class CandidateResult(BaseModel):
     is_winner: bool = False
     is_finalist: bool = False  # fusion: a valid answer that went to the judge
     fusion_judge_path: Optional[str] = None  # fusion: rendered judge-race line
+    fusion_judge_model: Optional[str] = None  # fusion: tier name of the judge that picked the winner
     from_paid_fallback: bool = False  # set when this came from a non-NIM paid endpoint

@@ -141,7 +141,7 @@ async def _judge_select(
     candidates: List[CandidateResult],
     pending_lanes: set,
     deadline: float,
-) -> Tuple[CandidateResult, str]:
+) -> Tuple[CandidateResult, str, Optional[str]]:
     """Hedged selection, nim-large style: dispatch judges one at a time staggered
     by fusion_judge_interval_seconds. Earlier judges stay in flight (first valid
     pick wins), but a backup is only fired if the previous one is slow — so a
@@ -155,17 +155,20 @@ async def _judge_select(
     judge chooses from the larger pool. This function owns `pending_lanes` and
     cancels whatever's left when it returns.
 
-    Returns the chosen candidate plus a rendered judge-race path for the console.
+    Returns the chosen candidate, a rendered judge-race path for the console,
+    and the tier name (e.g. "glm5") of the judge that made the pick — or None
+    if no judge decided and the fastest candidate was kept instead.
     """
     candidates = list(candidates)
     judge_models = _ordered_judges(virtual_model, strategy.fusion_tier)
     per_call = strategy.per_call_timeout_seconds or strategy.hard_timeout_seconds
     interval = max(1.0, strategy.fusion_judge_interval_seconds)
 
-    # judge task -> (short_model_name, labels, label_to_idx) snapshot at dispatch time
-    inflight: Dict[asyncio.Task, Tuple[str, List[str], Dict[str, int]]] = {}
+    # judge task -> (short_model_name, tier_name, labels, label_to_idx) snapshot at dispatch time
+    inflight: Dict[asyncio.Task, Tuple[str, str, List[str], Dict[str, int]]] = {}
     trace: List[Tuple[str, str]] = []
     selected: Optional[CandidateResult] = None
+    judge_name: Optional[str] = None
     next_idx = 0
     next_fire = time.monotonic()
     try:
@@ -186,7 +189,7 @@ async def _judge_select(
                         0.0, virtual_model, False,
                     )
                 )
-                inflight[task] = (jm.model.split("/")[-1], labels, label_to_idx)
+                inflight[task] = (jm.model.split("/")[-1], jm.name, labels, label_to_idx)
                 next_idx += 1
                 next_fire = now + interval
 
@@ -206,7 +209,7 @@ async def _judge_select(
             )
             for task in done:
                 if task in inflight:
-                    short, labels, label_to_idx = inflight.pop(task)
+                    short, tier_name, labels, label_to_idx = inflight.pop(task)
                     try:
                         result, _key = await task
                     except Exception:
@@ -223,6 +226,7 @@ async def _judge_select(
                     if letter is not None:
                         trace.append((short, "win"))
                         selected = candidates[label_to_idx[letter]]
+                        judge_name = tier_name
                         break
                     trace.append((short, "noparse"))
                 else:
@@ -235,7 +239,7 @@ async def _judge_select(
                         res.is_finalist = True
                         candidates.append(res)
     finally:
-        for t, (short, _labels, _map) in inflight.items():
+        for t, (short, _tier_name, _labels, _map) in inflight.items():
             if not t.done():
                 t.cancel()
             trace.append((short, "cancel"))
@@ -246,8 +250,8 @@ async def _judge_select(
     if selected is None:
         # Every judge failed/abstained — keep it simple: take the fastest answer.
         selected = min(candidates, key=lambda c: c.latency_ms)
-        return selected, _render_judge_path(trace, None)
-    return selected, _render_judge_path(trace, selected.real_model.split("/")[-1])
+        return selected, _render_judge_path(trace, None), None
+    return selected, _render_judge_path(trace, selected.real_model.split("/")[-1]), judge_name
 
 
 def _process_attempt(
@@ -398,10 +402,11 @@ async def fusion_completion(
         # answered yet) keep going in the background — _judge_select owns
         # `pending` now and folds in any new valid answers before dispatching
         # the next staggered judge.
-        winner, judge_path = await _judge_select(
+        winner, judge_path, judge_name = await _judge_select(
             request, strategy, virtual_model, valid, pending, deadline,
         )
         winner.fusion_judge_path = judge_path
+        winner.fusion_judge_model = judge_name
 
     winner.is_winner = True
     return winner, all_results
