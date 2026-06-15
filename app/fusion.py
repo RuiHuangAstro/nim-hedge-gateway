@@ -117,6 +117,18 @@ def _render_judge_path(trace: List[Tuple[str, str]], picked_model: Optional[str]
     return path
 
 
+def _ordered_judges(virtual_model: str, fusion_tier: str) -> List[RawModel]:
+    """Judge dispatch order — like nim-large, best-health first when ranking is
+    enabled for the tier, else config order."""
+    models = list(config.tiers.get(fusion_tier, []))
+    if config.ranking.is_enabled_for_tier(fusion_tier):
+        models.sort(
+            key=lambda x: health_store.get_candidate_health(virtual_model, x.name, x.model).score,
+            reverse=True,
+        )
+    return models
+
+
 async def _judge_select(
     request: ChatCompletionRequest,
     strategy: VirtualModelStrategy,
@@ -124,9 +136,12 @@ async def _judge_select(
     candidates: List[CandidateResult],
     deadline: float,
 ) -> Tuple[CandidateResult, str]:
-    """Hedged selection: fire judges concurrently, accept the first valid pick.
-    Falls back to the fastest candidate if every judge fails. Returns the chosen
-    candidate plus a rendered judge-race path for the console."""
+    """Hedged selection, nim-large style: dispatch judges one at a time staggered
+    by fusion_judge_interval_seconds. Earlier judges stay in flight (first valid
+    pick wins), but a backup is only fired if the previous one is slow — so a
+    fast judge means only one call is ever made. Falls back to the fastest
+    candidate if every judge fails. Returns the chosen candidate plus a rendered
+    judge-race path for the console."""
     # Shuffle labels once so a fixed answer order can't bias every judge.
     order = list(range(len(candidates)))
     random.shuffle(order)
@@ -134,33 +149,45 @@ async def _judge_select(
     label_to_idx = {lbl: order[i] for i, lbl in enumerate(labels)}
 
     judge_req = _build_judge_request(request, strategy.fusion_tier, candidates, label_to_idx)
-    judge_models: List[RawModel] = config.tiers.get(strategy.fusion_tier, [])
+    judge_models = _ordered_judges(virtual_model, strategy.fusion_tier)
     per_call = strategy.per_call_timeout_seconds or strategy.hard_timeout_seconds
+    interval = max(1.0, strategy.fusion_judge_interval_seconds)
 
-    task_to_model = {
-        asyncio.create_task(
-            call_with_dynamic_key(
-                jm, judge_req, strategy.hard_timeout_seconds, per_call,
-                0.0, virtual_model, False,
-            )
-        ): jm.model.split("/")[-1]
-        for jm in judge_models
-    }
+    inflight: Dict[asyncio.Task, str] = {}
     trace: List[Tuple[str, str]] = []
     selected: Optional[CandidateResult] = None
-    pending = set(task_to_model)
+    next_idx = 0
+    next_fire = time.monotonic()
     try:
-        while pending and selected is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED, timeout=remaining,
+        while selected is None and time.monotonic() < deadline:
+            now = time.monotonic()
+            # Stagger: fire the next judge only when its turn comes up.
+            if next_idx < len(judge_models) and now >= next_fire:
+                jm = judge_models[next_idx]
+                task = asyncio.create_task(
+                    call_with_dynamic_key(
+                        jm, judge_req, strategy.hard_timeout_seconds, per_call,
+                        0.0, virtual_model, False,
+                    )
+                )
+                inflight[task] = jm.model.split("/")[-1]
+                next_idx += 1
+                next_fire = now + interval
+
+            if not inflight:
+                if next_idx >= len(judge_models):
+                    break  # nothing in flight and nothing left to dispatch
+                await asyncio.sleep(max(0.0, min(next_fire, deadline) - time.monotonic()))
+                continue
+
+            # Wait until the next dispatch is due (if any) or a judge returns.
+            horizon = next_fire if next_idx < len(judge_models) else deadline
+            wait_for = max(0.0, min(horizon, deadline) - time.monotonic())
+            done, _ = await asyncio.wait(
+                set(inflight), timeout=wait_for, return_when=asyncio.FIRST_COMPLETED,
             )
-            if not done:
-                break
             for task in done:
-                short = task_to_model[task]
+                short = inflight.pop(task)
                 try:
                     result, _key = await task
                 except Exception:
@@ -180,10 +207,10 @@ async def _judge_select(
                     break
                 trace.append((short, "noparse"))
     finally:
-        for t in pending:
+        for t, short in inflight.items():
             if not t.done():
                 t.cancel()
-            trace.append((task_to_model[t], "cancel"))
+            trace.append((short, "cancel"))
 
     if selected is None:
         # Every judge failed/abstained — keep it simple: take the fastest answer.

@@ -75,7 +75,8 @@ virtual_models:
     per_call_timeout_seconds: 300
     fusion_tier: large
     fusion_min_valid: 2
-    fusion_retry_interval_seconds: 60
+    fusion_retry_interval_seconds: 60    # candidate lane re-fire interval
+    fusion_judge_interval_seconds: 20    # judge staggered-hedge dispatch interval
 
   nim-medium:
     description: "Balanced model pool for routine coding and analysis."

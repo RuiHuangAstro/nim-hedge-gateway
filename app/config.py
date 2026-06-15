@@ -66,6 +66,9 @@ class VirtualModelStrategy(BaseModel):
     # fusion_retry_interval_seconds until that model returns a valid answer (or
     # the whole collection stops because fusion_min_valid distinct models are in).
     fusion_retry_interval_seconds: float = 60.0
+    # Judge phase is a staggered hedge (nim-large style): dispatch one judge,
+    # and only fire the next if no valid pick has come back within this interval.
+    fusion_judge_interval_seconds: float = 20.0
 
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
