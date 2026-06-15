@@ -292,6 +292,11 @@ async def fusion_completion(
     if not valid:
         return None, all_results
 
+    # Every valid answer reached the judge — mark them all as finalists so the
+    # console shows fusion's "N in, 1 selected" shape, not a hedge cascade.
+    for c in valid:
+        c.is_finalist = True
+
     if len(valid) == 1:
         winner = valid[0]
     else:

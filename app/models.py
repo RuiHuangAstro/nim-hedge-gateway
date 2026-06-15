@@ -52,4 +52,5 @@ class CandidateResult(BaseModel):
     status_code: Optional[int] = None
     degraded: bool = False
     is_winner: bool = False
+    is_finalist: bool = False  # fusion: a valid answer that went to the judge
     from_paid_fallback: bool = False  # set when this came from a non-NIM paid endpoint

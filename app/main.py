@@ -247,6 +247,8 @@ async def chat_completions(request: ChatCompletionRequest):
         status_suffix = ""
         if res.is_winner:
             status_suffix = " [Win]"
+        elif res.is_finalist:
+            status_suffix = " [fin]"
         elif res.error and res.error != "Pending/Cancelled":
             status_suffix = " [!]"
 
