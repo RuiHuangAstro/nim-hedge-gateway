@@ -87,6 +87,7 @@ class ValidationResult(BaseModel):
 def validate_openai_chat_completion(
     result: CandidateResult,
     tools_schema: Optional[List[Dict[str, Any]]] = None,
+    check_repetition: bool = True,
 ) -> ValidationResult:
     if not result.response:
         return ValidationResult(ok=False, reason="No response object")
@@ -156,7 +157,10 @@ def validate_openai_chat_completion(
 
         # Detect repetition degeneration loops (e.g. "adorns:0.20000, and:0.20000, and:...")
         # Only check plain-text content; harmony-marker content is already handled above.
-        if has_content and not has_tool_calls and not has_harmony_markers(str(content)):
+        # nim-fusion disables this: it fans out several models and a judge selects
+        # the best, so a degenerate answer loses on its own — no need to risk
+        # dropping what might be the only candidate.
+        if check_repetition and has_content and not has_tool_calls and not has_harmony_markers(str(content)):
             is_loop, loop_reason = _detect_repetition_loop(str(content))
             if is_loop:
                 return ValidationResult(ok=False, reason=loop_reason)

@@ -175,7 +175,11 @@ def _process_attempt(
             result.latency_ms, result.error, api_alias=used_key,
         )
         return False
-    validation = validate_openai_chat_completion(result, tools_schema=request.tools)
+    # Fusion skips the repetition-loop check: the fan-out + judge already
+    # filters degenerate answers, so we don't risk dropping a sole candidate.
+    validation = validate_openai_chat_completion(
+        result, tools_schema=request.tools, check_repetition=False,
+    )
     if validation.ok:
         health_store.mark_success(
             virtual_model, result.candidate_name, result.latency_ms,

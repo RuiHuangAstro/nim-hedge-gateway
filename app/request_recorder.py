@@ -77,7 +77,11 @@ def _candidate_record(
             response_dict = result.response.model_dump()
         except Exception:
             response_dict = None
-        validation = validate_openai_chat_completion(result, tools_schema=request.tools)
+        # Match fusion's runtime policy (repetition is filtered by the judge,
+        # not rejected) so the recorded `valid` flag reflects what was accepted.
+        validation = validate_openai_chat_completion(
+            result, tools_schema=request.tools, check_repetition=False,
+        )
         valid = validation.ok
         validation_reason = None if validation.ok else validation.reason
 

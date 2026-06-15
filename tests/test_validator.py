@@ -153,6 +153,16 @@ def test_repetition_markdown_tables_pass():
     assert validation.ok is True, validation.reason
 
 
+def test_repetition_check_disabled_passes_loop():
+    # nim-fusion calls with check_repetition=False: a genuine loop must pass
+    # (the judge filters it), while still being rejected under the default.
+    content = "Here is the answer.\n" + ("the same broken line\n" * 60)
+    resp = MockResponse(choices=[MockChoice(message=MockMessage(content=content))])
+    result = CandidateResult(candidate_name="test", real_model="test", response=resp, latency_ms=100)
+    assert validate_openai_chat_completion(result).ok is False
+    assert validate_openai_chat_completion(result, check_repetition=False).ok is True
+
+
 def test_repetition_ascii_chart_passes():
     # ASCII bar chart: ')  0.0h ░░░' style rows repeat per day but are a small
     # fraction of the message. Must NOT be flagged.
